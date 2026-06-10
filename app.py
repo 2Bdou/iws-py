@@ -6,6 +6,7 @@ import sys
 import socket
 import struct
 import hashlib
+import hmac
 import base64
 import asyncio
 import aiohttp
@@ -149,10 +150,361 @@ async def resolve_host(host: str) -> str:
     
     return host  # 如果解析失败，返回原始域名
 
+SS_AEAD_METHOD = 'aes-128-gcm'
+SS_AEAD_KEY_LEN = 16
+SS_AEAD_SALT_LEN = 16
+SS_AEAD_NONCE_LEN = 12
+SS_AEAD_TAG_LEN = 16
+SS_AEAD_MAX_CHUNK_SIZE = 0x3fff
+SS_AEAD_INFO = b'ss-subkey'
+
+
+class ShadowsocksProtocolError(Exception):
+    pass
+
+
+def parse_shadowsocks_address(data: bytes):
+    if len(data) < 1:
+        return None
+
+    offset = 0
+    atyp = data[offset]
+    offset += 1
+
+    if atyp == 1:  # IPv4
+        if len(data) < offset + 4 + 2:
+            return None
+        host = '.'.join(str(b) for b in data[offset:offset+4])
+        offset += 4
+    elif atyp == 3:  # 域名
+        if len(data) < offset + 1:
+            return None
+        host_len = data[offset]
+        offset += 1
+        if host_len == 0:
+            raise ShadowsocksProtocolError('Invalid empty Shadowsocks host')
+        if len(data) < offset + host_len + 2:
+            return None
+        try:
+            host = data[offset:offset+host_len].decode()
+        except UnicodeDecodeError as exc:
+            raise ShadowsocksProtocolError('Invalid Shadowsocks host encoding') from exc
+        offset += host_len
+    elif atyp == 4:  # IPv6
+        if len(data) < offset + 16 + 2:
+            return None
+        host = ':'.join(f'{(data[j] << 8) + data[j+1]:04x}' 
+                      for j in range(offset, offset+16, 2))
+        offset += 16
+    else:
+        raise ShadowsocksProtocolError('Invalid Shadowsocks address type')
+
+    port = struct.unpack('!H', data[offset:offset+2])[0]
+    offset += 2
+    return host, port, offset
+
+
+def evp_bytes_to_key(password: bytes, key_len: int) -> bytes:
+    result = b''
+    prev = b''
+    while len(result) < key_len:
+        prev = hashlib.md5(prev + password).digest()
+        result += prev
+    return result[:key_len]
+
+
+def hkdf_sha1(salt: bytes, key: bytes, info: bytes, length: int) -> bytes:
+    prk = hmac.new(salt, key, hashlib.sha1).digest()
+    okm = b''
+    prev = b''
+    counter = 1
+    while len(okm) < length:
+        prev = hmac.new(prk, prev + info + bytes([counter]), hashlib.sha1).digest()
+        okm += prev
+        counter += 1
+    return okm[:length]
+
+
+AES_SBOX = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+]
+
+AES_RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+GCM_R = 0xe1000000000000000000000000000000
+
+
+def aes_xtime(value: int) -> int:
+    value <<= 1
+    if value & 0x100:
+        value ^= 0x11b
+    return value & 0xff
+
+
+class Aes128:
+    def __init__(self, key: bytes):
+        if len(key) != 16:
+            raise ValueError('AES-128 key must be 16 bytes')
+        self.round_keys = self.expand_key(key)
+
+    @staticmethod
+    def expand_key(key: bytes) -> list:
+        expanded = list(key)
+        rcon_iter = 1
+        while len(expanded) < 176:
+            temp = expanded[-4:]
+            if len(expanded) % 16 == 0:
+                temp = temp[1:] + temp[:1]
+                temp = [AES_SBOX[b] for b in temp]
+                temp[0] ^= AES_RCON[rcon_iter]
+                rcon_iter += 1
+            for value in temp:
+                expanded.append(expanded[-16] ^ value)
+        return expanded
+
+    @staticmethod
+    def add_round_key(state: list, round_key: list):
+        for i in range(16):
+            state[i] ^= round_key[i]
+
+    @staticmethod
+    def sub_bytes(state: list):
+        for i, value in enumerate(state):
+            state[i] = AES_SBOX[value]
+
+    @staticmethod
+    def shift_rows(state: list):
+        state[1], state[5], state[9], state[13] = state[5], state[9], state[13], state[1]
+        state[2], state[6], state[10], state[14] = state[10], state[14], state[2], state[6]
+        state[3], state[7], state[11], state[15] = state[15], state[3], state[7], state[11]
+
+    @staticmethod
+    def mix_columns(state: list):
+        for i in range(0, 16, 4):
+            a0, a1, a2, a3 = state[i:i+4]
+            t = a0 ^ a1 ^ a2 ^ a3
+            state[i] ^= t ^ aes_xtime(a0 ^ a1)
+            state[i+1] ^= t ^ aes_xtime(a1 ^ a2)
+            state[i+2] ^= t ^ aes_xtime(a2 ^ a3)
+            state[i+3] ^= t ^ aes_xtime(a3 ^ a0)
+
+    def encrypt_block(self, block: bytes) -> bytes:
+        if len(block) != 16:
+            raise ValueError('AES block must be 16 bytes')
+        state = list(block)
+        self.add_round_key(state, self.round_keys[:16])
+
+        for round_index in range(1, 10):
+            self.sub_bytes(state)
+            self.shift_rows(state)
+            self.mix_columns(state)
+            start = round_index * 16
+            self.add_round_key(state, self.round_keys[start:start+16])
+
+        self.sub_bytes(state)
+        self.shift_rows(state)
+        self.add_round_key(state, self.round_keys[160:176])
+        return bytes(state)
+
+
+def xor_bytes(left: bytes, right: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def inc32(counter: bytearray):
+    value = (int.from_bytes(counter[12:16], 'big') + 1) & 0xffffffff
+    counter[12:16] = value.to_bytes(4, 'big')
+
+
+def gcm_mul(x: int, y: int) -> int:
+    z = 0
+    v = x
+    for i in range(128):
+        if (y >> (127 - i)) & 1:
+            z ^= v
+        if v & 1:
+            v = (v >> 1) ^ GCM_R
+        else:
+            v >>= 1
+    return z
+
+
+def ghash(h: int, aad: bytes, ciphertext: bytes) -> bytes:
+    y = 0
+
+    def update(block: bytes):
+        nonlocal y
+        y = gcm_mul(y ^ int.from_bytes(block, 'big'), h)
+
+    for data in (aad, ciphertext):
+        for offset in range(0, len(data), 16):
+            block = data[offset:offset+16]
+            if len(block) < 16:
+                block += b'\x00' * (16 - len(block))
+            update(block)
+
+    update((len(aad) * 8).to_bytes(8, 'big') + (len(ciphertext) * 8).to_bytes(8, 'big'))
+    return y.to_bytes(16, 'big')
+
+
+class Aes128Gcm:
+    def __init__(self, key: bytes):
+        self.aes = Aes128(key)
+        self.h = int.from_bytes(self.aes.encrypt_block(b'\x00' * 16), 'big')
+
+    def gctr(self, initial_counter: bytes, data: bytes) -> bytes:
+        if not data:
+            return b''
+        counter = bytearray(initial_counter)
+        output = bytearray()
+        for offset in range(0, len(data), 16):
+            block = data[offset:offset+16]
+            key_stream = self.aes.encrypt_block(bytes(counter))
+            output.extend(xor_bytes(block, key_stream[:len(block)]))
+            inc32(counter)
+        return bytes(output)
+
+    def encrypt(self, nonce: bytes, plaintext: bytes, aad: bytes = b'') -> bytes:
+        if len(nonce) != 12:
+            raise ValueError('AES-GCM nonce must be 12 bytes')
+        j0 = nonce + b'\x00\x00\x00\x01'
+        initial_counter = bytearray(j0)
+        inc32(initial_counter)
+        ciphertext = self.gctr(bytes(initial_counter), plaintext)
+        tag_mask = self.aes.encrypt_block(j0)
+        tag = xor_bytes(tag_mask, ghash(self.h, aad, ciphertext))
+        return ciphertext + tag
+
+    def decrypt(self, nonce: bytes, data: bytes, aad: bytes = b'') -> bytes:
+        if len(data) < SS_AEAD_TAG_LEN:
+            raise ValueError('Missing AES-GCM tag')
+        ciphertext = data[:-SS_AEAD_TAG_LEN]
+        tag = data[-SS_AEAD_TAG_LEN:]
+        j0 = nonce + b'\x00\x00\x00\x01'
+        expected_tag = xor_bytes(self.aes.encrypt_block(j0), ghash(self.h, aad, ciphertext))
+        if not hmac.compare_digest(tag, expected_tag):
+            raise ValueError('Invalid AES-GCM tag')
+        initial_counter = bytearray(j0)
+        inc32(initial_counter)
+        return self.gctr(bytes(initial_counter), ciphertext)
+
+
+def increment_shadowsocks_nonce(nonce: bytearray):
+    for i in range(len(nonce)):
+        nonce[i] = (nonce[i] + 1) & 0xff
+        if nonce[i] != 0:
+            break
+
+
+class ShadowsocksAeadCrypto:
+    def __init__(self, password: str):
+        self.master_key = evp_bytes_to_key(password.encode(), SS_AEAD_KEY_LEN)
+
+    def cipher_for_salt(self, salt: bytes) -> Aes128Gcm:
+        if len(salt) != SS_AEAD_SALT_LEN:
+            raise ShadowsocksProtocolError('Invalid Shadowsocks AEAD salt')
+        subkey = hkdf_sha1(salt, self.master_key, SS_AEAD_INFO, SS_AEAD_KEY_LEN)
+        return Aes128Gcm(subkey)
+
+
+class ShadowsocksAeadDecoder:
+    def __init__(self, password: str):
+        self.crypto = ShadowsocksAeadCrypto(password)
+        self.buffer = bytearray()
+        self.cipher = None
+        self.nonce = bytearray(SS_AEAD_NONCE_LEN)
+        self.pending_len = None
+
+    def feed(self, data: bytes):
+        self.buffer.extend(data)
+
+    def next_nonce(self) -> bytes:
+        nonce = bytes(self.nonce)
+        increment_shadowsocks_nonce(self.nonce)
+        return nonce
+
+    def next_chunk(self):
+        if self.cipher is None:
+            if len(self.buffer) < SS_AEAD_SALT_LEN:
+                return None
+            salt = bytes(self.buffer[:SS_AEAD_SALT_LEN])
+            del self.buffer[:SS_AEAD_SALT_LEN]
+            self.cipher = self.crypto.cipher_for_salt(salt)
+
+        if self.pending_len is None:
+            encrypted_len_size = 2 + SS_AEAD_TAG_LEN
+            if len(self.buffer) < encrypted_len_size:
+                return None
+            encrypted_len = bytes(self.buffer[:encrypted_len_size])
+            del self.buffer[:encrypted_len_size]
+            try:
+                length_bytes = self.cipher.decrypt(self.next_nonce(), encrypted_len)
+            except ValueError as exc:
+                raise ShadowsocksProtocolError('Invalid Shadowsocks AEAD length tag') from exc
+            self.pending_len = struct.unpack('!H', length_bytes)[0]
+            if self.pending_len > SS_AEAD_MAX_CHUNK_SIZE:
+                raise ShadowsocksProtocolError('Invalid Shadowsocks AEAD chunk size')
+
+        encrypted_payload_size = self.pending_len + SS_AEAD_TAG_LEN
+        if len(self.buffer) < encrypted_payload_size:
+            return None
+
+        encrypted_payload = bytes(self.buffer[:encrypted_payload_size])
+        del self.buffer[:encrypted_payload_size]
+        try:
+            payload = self.cipher.decrypt(self.next_nonce(), encrypted_payload)
+        except ValueError as exc:
+            raise ShadowsocksProtocolError('Invalid Shadowsocks AEAD payload tag') from exc
+        self.pending_len = None
+        return payload
+
+
+class ShadowsocksAeadEncoder:
+    def __init__(self, password: str):
+        self.crypto = ShadowsocksAeadCrypto(password)
+        self.salt = os.urandom(SS_AEAD_SALT_LEN)
+        self.cipher = self.crypto.cipher_for_salt(self.salt)
+        self.nonce = bytearray(SS_AEAD_NONCE_LEN)
+        self.salt_sent = False
+
+    def next_nonce(self) -> bytes:
+        nonce = bytes(self.nonce)
+        increment_shadowsocks_nonce(self.nonce)
+        return nonce
+
+    def encrypt(self, data: bytes) -> bytes:
+        output = bytearray()
+        if not self.salt_sent:
+            output.extend(self.salt)
+            self.salt_sent = True
+
+        for offset in range(0, len(data), SS_AEAD_MAX_CHUNK_SIZE):
+            chunk = data[offset:offset+SS_AEAD_MAX_CHUNK_SIZE]
+            output.extend(self.cipher.encrypt(self.next_nonce(), struct.pack('!H', len(chunk))))
+            output.extend(self.cipher.encrypt(self.next_nonce(), chunk))
+
+        return bytes(output)
+
+
 class ProxyHandler:
-    def __init__(self, uuid: str):
+    def __init__(self, uuid: str, ss_password: str = None):
         self.uuid = uuid
         self.uuid_bytes = bytes.fromhex(uuid)
+        self.ss_password = ss_password or uuid
         
     async def handle_vless(self, websocket, first_msg: bytes) -> bool:
         """处理VLS协议"""
@@ -366,46 +718,121 @@ class ProxyHandler:
                 logger.error(f"Tro handler error: {e}")
             return False
     
-    async def handle_shadowsocks(self, websocket, first_msg: bytes) -> bool:
-        """处理ss协议"""
+    async def handle_shadowsocks_aes_128_gcm(self, websocket, first_msg: bytes) -> bool:
+        """处理ss aes-128-gcm协议"""
         try:
-            if len(first_msg) < 7:
+            decoder = ShadowsocksAeadDecoder(self.ss_password)
+            encoder = ShadowsocksAeadEncoder(self.ss_password)
+            plaintext = bytearray()
+            parsed = None
+            decoder.feed(first_msg)
+
+            while parsed is None:
+                while True:
+                    chunk = decoder.next_chunk()
+                    if chunk is None:
+                        break
+                    plaintext.extend(chunk)
+                    parsed = parse_shadowsocks_address(plaintext)
+                    if parsed is not None:
+                        break
+
+                if parsed is not None:
+                    break
+
+                if len(plaintext) > SS_AEAD_MAX_CHUNK_SIZE:
+                    raise ShadowsocksProtocolError('Shadowsocks address header is too large')
+
+                msg = await asyncio.wait_for(websocket.receive(), timeout=5)
+                if msg.type != aiohttp.WSMsgType.BINARY:
+                    return False
+                decoder.feed(msg.data)
+
+            host, port, offset = parsed
+            
+            if is_blocked_domain(host):
+                await websocket.close()
                 return False
             
-            offset = 0
-            atyp = first_msg[offset]
-            offset += 1
+            # 连接目标
+            resolved_host = await resolve_host(host)
             
-            # 解析地址
-            host = ''
-            if atyp == 1:  # IPv4
-                if offset + 4 > len(first_msg):
-                    return False
-                host = '.'.join(str(b) for b in first_msg[offset:offset+4])
-                offset += 4
-            elif atyp == 3:  # 域名
-                if offset >= len(first_msg):
-                    return False
-                host_len = first_msg[offset]
-                offset += 1
-                if offset + host_len > len(first_msg):
-                    return False
-                host = first_msg[offset:offset+host_len].decode()
-                offset += host_len
-            elif atyp == 4:  # IPv6
-                if offset + 16 > len(first_msg):
-                    return False
-                host = ':'.join(f'{(first_msg[j] << 8) + first_msg[j+1]:04x}' 
-                              for j in range(offset, offset+16, 2))
-                offset += 16
-            else:
+            try:
+                reader, writer = await asyncio.open_connection(resolved_host, port)
+                
+                wrote_initial = False
+                if offset < len(plaintext):
+                    writer.write(plaintext[offset:])
+                    wrote_initial = True
+
+                while True:
+                    chunk = decoder.next_chunk()
+                    if chunk is None:
+                        break
+                    if chunk:
+                        writer.write(chunk)
+                        wrote_initial = True
+
+                if wrote_initial:
+                    await writer.drain()
+                
+                async def forward_ws_to_tcp():
+                    try:
+                        async for msg in websocket:
+                            if msg.type == aiohttp.WSMsgType.BINARY:
+                                decoder.feed(msg.data)
+                                wrote_data = False
+                                while True:
+                                    chunk = decoder.next_chunk()
+                                    if chunk is None:
+                                        break
+                                    if chunk:
+                                        writer.write(chunk)
+                                        wrote_data = True
+                                if wrote_data:
+                                    await writer.drain()
+                    except:
+                        pass
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+                
+                async def forward_tcp_to_ws():
+                    try:
+                        while True:
+                            data = await reader.read(4096)
+                            if not data:
+                                break
+                            await websocket.send_bytes(encoder.encrypt(data))
+                    except:
+                        pass
+                
+                await asyncio.gather(
+                    forward_ws_to_tcp(),
+                    forward_tcp_to_ws()
+                )
+                
+            except Exception as e:
+                if DEBUG:
+                    logger.error(f"Connection error: {e}")
+            
+            return True
+            
+        except (asyncio.TimeoutError, ShadowsocksProtocolError):
+            return False
+        except Exception as e:
+            if DEBUG:
+                logger.error(f"Shadowsocks aes-128-gcm handler error: {e}")
+            return False
+
+    async def handle_shadowsocks(self, websocket, first_msg: bytes) -> bool:
+        """处理ss none协议，兼容旧链接"""
+        try:
+            parsed = parse_shadowsocks_address(first_msg)
+            if parsed is None:
                 return False
-            
-            if offset + 2 > len(first_msg):
-                return False
-            port = struct.unpack('!H', first_msg[offset:offset+2])[0]
-            offset += 2
-            
+            host, port, offset = parsed
+
             if is_blocked_domain(host):
                 await websocket.close()
                 return False
@@ -453,6 +880,8 @@ class ProxyHandler:
             
             return True
             
+        except ShadowsocksProtocolError:
+            return False
         except Exception as e:
             if DEBUG:
                 logger.error(f"Shadowsocks handler error: {e}")
@@ -468,7 +897,7 @@ async def websocket_handler(request):
         await ws.close()
         return ws
     
-    proxy = ProxyHandler(CUUID)
+    proxy = ProxyHandler(CUUID, UUID)
     
     try:
         first_msg = await asyncio.wait_for(ws.receive(), timeout=5)
@@ -488,9 +917,22 @@ async def websocket_handler(request):
             if await proxy.handle_trojan(ws, msg_data):
                 return ws
         
-        # 尝试ss
+        # 尝试ss aes-128-gcm
+        tried_shadowsocks_aead = False
+        if len(msg_data) > 0 and (
+            len(msg_data) >= SS_AEAD_SALT_LEN + 2 + SS_AEAD_TAG_LEN or msg_data[0] not in (1, 3, 4)
+        ):
+            tried_shadowsocks_aead = True
+            if await proxy.handle_shadowsocks_aes_128_gcm(ws, msg_data):
+                return ws
+
+        # 尝试ss none，兼容旧链接
         if len(msg_data) > 0 and msg_data[0] in (1, 3, 4):
             if await proxy.handle_shadowsocks(ws, msg_data):
+                return ws
+
+        if not tried_shadowsocks_aead:
+            if await proxy.handle_shadowsocks_aes_128_gcm(ws, msg_data):
                 return ws
         
         await ws.close()
@@ -525,7 +967,7 @@ async def http_handler(request):
         vless_url = f"vless://{UUID}@{CurrentDomain}:{CurrentPort}?encryption=none&security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
         trojan_url = f"trojan://{UUID}@{CurrentDomain}:{CurrentPort}?security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
         
-        ss_method_password = base64.b64encode(f"none:{UUID}".encode()).decode()
+        ss_method_password = base64.b64encode(f"{SS_AEAD_METHOD}:{UUID}".encode()).decode()
         ss_url = f"ss://{ss_method_password}@{CurrentDomain}:{CurrentPort}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D{CurrentDomain};path%3D%2F{WSPATH};{ss_tls_param}sni%3D{CurrentDomain};skip-cert-verify%3Dtrue;mux%3D0#{name_part}"
         
         subscription = f"{vless_url}\n{trojan_url}\n{ss_url}"
